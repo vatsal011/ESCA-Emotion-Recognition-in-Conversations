@@ -1,4 +1,4 @@
-# ESCA-Emotion-Recognition-in-Conversations
+# ESCA: Emotion Recognition in Conversations
 
 ## Overview
 
@@ -9,8 +9,8 @@ conversational context.
 This project reproduces the ESD-ERC model from scratch
 using PyTorch and proposes **ESCA (Emotion-Shift-aware
 Class-weighted Adaptation)** to address class imbalance
-by using emotion shifts as a signal for identifying
-difficult training samples.
+by using emotion shifts to identify difficult training
+samples.
 
 ## Methods
 
@@ -18,36 +18,39 @@ difficult training samples.
   combining a shared BERT encoder, BiLSTM-based Emotion
   Shift Detection (ESD), and a 6-layer Transformer encoder.
 - Evaluated the model on **DailyDialog and MELD**,
-  analyzing the impact of severe class imbalance and
+  investigating the effects of class imbalance and
   emotion shifts on classification performance.
 - Proposed **ESCA**, a custom loss-weighting technique
   that increases the contribution of minority-class
   utterances occurring at detected emotion shifts.
 
-The proposed per-sample weight is:
+**ESCA per-sample weight:**
 
-\[
+$$
 w_i = w_{cls}(y_i)
-(1+\alpha \cdot \mathbb{1}[s_i=1])
-\]
+\left(1 + \alpha \cdot \mathbb{1}[s_i = 1]\right)
+$$
 
-The modified emotion loss is:
+**Modified emotion loss:**
 
-\[
-L_{ESCA} = L_{EM}^{ESCA} + L_{ES}
-\]
-
-where:
-
-\[
+$$
 L_{EM}^{ESCA} =
 \frac{1}{N_{valid}}
-\sum_{i \in valid} w_i \cdot CE_i
-\]
+\sum_{i \in valid}
+w_i \cdot CE_i
+$$
 
-Here, \(w_{cls}\) is the inverse-frequency class weight,
-\(s_i\) indicates an emotion shift, and \(\alpha=0.5\)
-controls the additional shift-based weighting.
+**Combined multi-task loss:**
+
+$$
+L_{ESCA} = L_{EM}^{ESCA} + L_{ES}
+$$
+
+Here, \(w_{cls}\) represents the inverse-frequency
+class weight, \(s_i\) indicates an emotion shift, and
+\(\alpha = 0.5\) controls the additional shift-based
+weighting. Setting \(\alpha = 0\) reduces ESCA to
+standard class weighting.
 
 ## Key Findings
 
