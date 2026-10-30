@@ -1,0 +1,1351 @@
+# =============================================================================
+# ESD-ERC: Emotion Recognition in Conversations with Emotion Shift Detection
+# Based on: Gao et al., Knowledge-Based Systems 248 (2022) 108861
+#
+# Full Implementation: Dataset Loading → Preprocessing → Model → Training → Results
+#
+# Compatible with: Google Colab / VS Code (Python 3.8+)
+# =============================================================================
+
+# =============================================================================
+# SECTION 0: INSTALL DEPENDENCIES
+# =============================================================================
+# Run this block first (especially in Colab):
+#
+#   !pip install torch transformers scikit-learn pandas numpy matplotlib seaborn
+#   !pip install datasets   # for easy DailyDialog download
+
+# =============================================================================
+# SECTION 1: IMPORTS
+# =============================================================================
+
+import os
+import json
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+
+from transformers import BertTokenizer, BertModel, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score, classification_report
+from sklearn.preprocessing import LabelEncoder
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+
+# =============================================================================
+# SECTION 2: DATASET LOADING
+# =============================================================================
+#
+# ── DailyDialog ──────────────────────────────────────────────────────────────
+#
+#  DOWNLOAD (Kaggle — free account required):
+#    https://www.kaggle.com/datasets/thedevastator/dailydialog-multi-turn-dialog-with-intention-and
+#
+#  Via Kaggle API in Colab (after uploading your kaggle.json token):
+#    !pip install kaggle -q
+#    !mkdir -p ~/.kaggle && cp kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+#    !kaggle datasets download -d thedevastator/dailydialog-multi-turn-dialog-with-intention-and
+#    !unzip -q dailydialog-multi-turn-dialog-with-intention-and.zip -d ./dailydialog
+#
+#  The zip extracts to 3 CSV files:
+#    ./dailydialog/train.csv
+#    ./dailydialog/validation.csv
+#    ./dailydialog/test.csv
+#
+#  Each CSV has columns:
+#    dialog   — list of utterance strings stored as a Python list-string
+#               e.g. "[\'Hello how are you ?\', \'Fine thanks .\']"
+#    emotion  — matching list of int labels, e.g. "[0, 4]"
+#    act      — dialog act labels (not used here)
+#
+#  Then set:
+#    CONFIG["dailydialog_dir"] = "./dailydialog"
+#
+# ── MELD ─────────────────────────────────────────────────────────────────────
+#
+#  DOWNLOAD:
+#    https://github.com/declare-lab/MELD  → Releases tab → download data.zip
+#
+#  SETUP: Extract so you have:
+#    ./data/meld/train_sent_emo.csv
+#    ./data/meld/dev_sent_emo.csv
+#    ./data/meld/test_sent_emo.csv
+#
+#  Then set:
+#    CONFIG["dataset"]  = "meld"
+#    CONFIG["meld_dir"] = "./data/meld"
+#
+# =============================================================================
+
+EMOTION_MAP = {
+    0: "neutral", 1: "anger", 2: "disgust",
+    3: "fear",    4: "happiness", 5: "sadness", 6: "surprise"
+}
+EMOTION_LABELS = list(EMOTION_MAP.values())
+
+
+def _parse_list_column(raw):
+    """
+    Safely parse a CSV column stored as a Python list-string.
+    Handles both:
+      "[\'hello\', \'world\']"  -> list of strings
+      "[0, 4, 0]"                   -> list of ints
+    Falls back to bracket-strip + comma-split on ast failure.
+    """
+    import ast
+    if isinstance(raw, list):
+        return raw
+    raw = str(raw).strip()
+    try:
+        return ast.literal_eval(raw)
+    except Exception:
+        raw = raw.strip("[]")
+        parts = [p.strip().strip("\'\"") for p in raw.split(",") if p.strip()]
+        return parts
+
+
+def load_dailydialog(data_dir="./data/dailydialog"):
+    """
+    Load DailyDialog from the Kaggle CSV files (train.csv / validation.csv / test.csv).
+
+    Expected columns per row:
+      dialog  — full conversation as a Python list-string of utterances
+      emotion — matching list of int emotion labels (0-6)
+
+    Emotion int mapping:
+      0=neutral 1=anger 2=disgust 3=fear 4=happiness 5=sadness 6=surprise
+
+    DailyDialog has no speaker IDs; speakers alternate A / B.
+    """
+    print(f"Loading DailyDialog from: {data_dir}")
+
+    def read_csv_split(filename):
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(
+                f"File not found: {filepath}\n"
+                f"Make sure \'{data_dir}\' contains train.csv, validation.csv, test.csv.\n"
+                f"Download from Kaggle:\n"
+                f"  https://www.kaggle.com/datasets/thedevastator/"
+                f"dailydialog-multi-turn-dialog-with-intention-and"
+            )
+
+        df = pd.read_csv(filepath)
+        df.columns = [c.lower().strip() for c in df.columns]  # normalise column names
+
+        if "dialog" not in df.columns:
+            raise KeyError(
+                f"Expected a \'dialog\' column in {filepath}. "
+                f"Found: {list(df.columns)}"
+            )
+
+        conversations = []
+        for _, row in df.iterrows():
+            utterances = _parse_list_column(row["dialog"])
+            emotions   = _parse_list_column(row["emotion"]) if "emotion" in df.columns \
+                         else [0] * len(utterances)
+
+            length = min(len(utterances), len(emotions))
+            conv = []
+            for idx in range(length):
+                utt = str(utterances[idx]).strip()
+                if not utt:
+                    continue
+                try:
+                    emo_int = int(str(emotions[idx]).strip())
+                except ValueError:
+                    emo_int = 0
+                conv.append({
+                    "utterance": utt,
+                    "speaker":   "A" if idx % 2 == 0 else "B",
+                    "emotion":   EMOTION_MAP.get(emo_int, "neutral")
+                })
+            if conv:
+                conversations.append(conv)
+        return conversations
+
+    train = read_csv_split("train.csv")
+    val   = read_csv_split("validation.csv")
+    test  = read_csv_split("test.csv")
+    print(f"  Train: {len(train)} convs | Val: {len(val)} | Test: {len(test)}")
+    return train, val, test, EMOTION_LABELS
+
+
+
+def load_meld(data_dir="./data/meld"):
+    """
+    Load MELD from local CSV files.
+    Download from: https://github.com/declare-lab/MELD
+    """
+    print("Loading MELD...")
+
+    def read_split(path):
+        df = pd.read_csv(path)
+        conversations = defaultdict(list)
+        for _, row in df.iterrows():
+            conv_id = row["Dialogue_ID"]
+            conversations[conv_id].append({
+                "utterance": str(row["Utterance"]).strip(),
+                "speaker":   str(row["Speaker"]),
+                "emotion":   str(row["Emotion"]).lower()
+            })
+        # Sort utterances within each conversation by utterance ID
+        result = []
+        for conv_id in sorted(conversations.keys()):
+            result.append(conversations[conv_id])
+        return result
+
+    train = read_split(os.path.join(data_dir, "train_sent_emo.csv"))
+    val   = read_split(os.path.join(data_dir, "dev_sent_emo.csv"))
+    test  = read_split(os.path.join(data_dir, "test_sent_emo.csv"))
+
+    emotion_labels = ["neutral", "anger", "disgust", "fear", "joy", "sadness", "surprise"]
+    print(f"MELD loaded — Train: {len(train)}, Val: {len(val)}, Test: {len(test)}")
+    return train, val, test, emotion_labels
+
+
+# =============================================================================
+# SECTION 3: PREPROCESSING — EMOTION SHIFT LABEL GENERATION
+# =============================================================================
+
+def generate_emotion_shift_labels(conversations):
+    """
+    For each utterance, generate an emotion shift label:
+      [Start] = 2  → speaker's first utterance in the conversation
+      0             → same emotion as speaker's previous utterance
+      1             → different emotion (shift occurred)
+
+    Operates per-speaker: only compares consecutive utterances
+    from the SAME speaker, as described in the paper (Section 3.1).
+    """
+    processed = []
+    for conv in conversations:
+        speaker_last_emotion = {}   # tracks last seen emotion per speaker
+        conv_with_shifts = []
+
+        for utt_dict in conv:
+            speaker = utt_dict["speaker"]
+            emotion = utt_dict["emotion"]
+
+            if speaker not in speaker_last_emotion:
+                shift_label = 2   # [Start]
+            else:
+                prev_emotion = speaker_last_emotion[speaker]
+                shift_label  = 0 if emotion == prev_emotion else 1
+
+            speaker_last_emotion[speaker] = emotion
+            conv_with_shifts.append({**utt_dict, "shift_label": shift_label})
+
+        processed.append(conv_with_shifts)
+    return processed
+
+
+def build_label_encoder(conversations, emotion_labels):
+    """Fit a LabelEncoder on the known emotion label set."""
+    le = LabelEncoder()
+    le.fit(emotion_labels)
+    return le
+
+
+def dataset_stats(conversations, label_encoder, split_name="Train"):
+    """Print label distribution for a dataset split."""
+    emotion_counts = defaultdict(int)
+    shift_counts   = defaultdict(int)
+    for conv in conversations:
+        for utt in conv:
+            emotion_counts[utt["emotion"]] += 1
+            shift_counts[utt["shift_label"]] += 1
+
+    print(f"\n{'='*50}")
+    print(f"{split_name} Set Statistics")
+    print(f"  Conversations : {len(conversations)}")
+    print(f"  Utterances    : {sum(len(c) for c in conversations)}")
+    print(f"\n  Emotion Distribution:")
+    for emo, cnt in sorted(emotion_counts.items()):
+        print(f"    {emo:<12}: {cnt}")
+    print(f"\n  Shift Label Distribution:")
+    for lbl, cnt in sorted(shift_counts.items()):
+        name = {0: "No Shift", 1: "Shift", 2: "[Start]"}.get(lbl, str(lbl))
+        print(f"    {name:<12}: {cnt}")
+    print('='*50)
+
+
+# =============================================================================
+# SECTION 4: PYTORCH DATASET AND DATALOADER
+# =============================================================================
+
+class ConversationDataset(Dataset):
+    """
+    Tokenises every utterance with BERT and stores conversation-level data.
+    Each item in the dataset is one full conversation.
+    """
+    def __init__(self, conversations, label_encoder, tokenizer, max_len=128):
+        self.conversations  = conversations
+        self.label_encoder  = label_encoder
+        self.tokenizer      = tokenizer
+        self.max_len        = max_len
+
+    def __len__(self):
+        return len(self.conversations)
+
+    def __getitem__(self, idx):
+        conv = self.conversations[idx]
+
+        input_ids_list      = []
+        attention_mask_list = []
+        emotion_labels      = []
+        shift_labels        = []
+        speakers            = []
+
+        for utt_dict in conv:
+            encoding = self.tokenizer(
+                utt_dict["utterance"],
+                max_length=self.max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            input_ids_list.append(encoding["input_ids"].squeeze(0))
+            attention_mask_list.append(encoding["attention_mask"].squeeze(0))
+            emotion_labels.append(
+                int(self.label_encoder.transform([utt_dict["emotion"]])[0])
+            )
+            shift_labels.append(int(utt_dict["shift_label"]))
+            speakers.append(utt_dict["speaker"])
+
+        return {
+            "input_ids":       torch.stack(input_ids_list),       # [T, seq_len]
+            "attention_mask":  torch.stack(attention_mask_list),   # [T, seq_len]
+            "emotion_labels":  torch.tensor(emotion_labels, dtype=torch.long),
+            "shift_labels":    torch.tensor(shift_labels,   dtype=torch.long),
+            "speakers":        speakers,
+            "length":          len(conv)
+        }
+
+
+def collate_fn(batch):
+    """
+    Pads conversations in a batch to the same length (number of utterances).
+    """
+    max_len    = max(item["length"] for item in batch)
+    seq_len    = batch[0]["input_ids"].shape[1]
+    batch_size = len(batch)
+
+    # Initialise padded tensors
+    input_ids_batch      = torch.zeros(batch_size, max_len, seq_len, dtype=torch.long)
+    attention_mask_batch = torch.zeros(batch_size, max_len, seq_len, dtype=torch.long)
+    emotion_labels_batch = torch.full((batch_size, max_len), -1, dtype=torch.long)
+    shift_labels_batch   = torch.full((batch_size, max_len), -1, dtype=torch.long)
+    conv_lengths         = []
+
+    for i, item in enumerate(batch):
+        T = item["length"]
+        input_ids_batch[i, :T]      = item["input_ids"]
+        attention_mask_batch[i, :T] = item["attention_mask"]
+        emotion_labels_batch[i, :T] = item["emotion_labels"]
+        shift_labels_batch[i, :T]   = item["shift_labels"]
+        conv_lengths.append(T)
+
+    return {
+        "input_ids":      input_ids_batch,
+        "attention_mask": attention_mask_batch,
+        "emotion_labels": emotion_labels_batch,
+        "shift_labels":   shift_labels_batch,
+        "lengths":        conv_lengths
+    }
+
+
+def build_dataloaders(train_convs, val_convs, test_convs,
+                      label_encoder, tokenizer,
+                      batch_size=8, max_len=128):
+    train_ds = ConversationDataset(train_convs, label_encoder, tokenizer, max_len)
+    val_ds   = ConversationDataset(val_convs,   label_encoder, tokenizer, max_len)
+    test_ds  = ConversationDataset(test_convs,  label_encoder, tokenizer, max_len)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              collate_fn=collate_fn)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              collate_fn=collate_fn)
+    return train_loader, val_loader, test_loader
+
+
+# =============================================================================
+# SECTION 5: MODEL ARCHITECTURE
+# =============================================================================
+
+class UtteranceEncoder(nn.Module):
+    """
+    Shared BERT-based encoder (Section 3.3).
+    Returns [CLS] token embedding as the utterance's emotion semantic
+    representation.
+    """
+    def __init__(self, bert_model_name="bert-base-uncased"):
+        super().__init__()
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        self.hidden_size = self.bert.config.hidden_size  # 768
+
+    def forward(self, input_ids, attention_mask):
+        """
+        input_ids, attention_mask: [B*T, seq_len]
+        Returns: [B*T, hidden_size]
+        """
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.last_hidden_state[:, 0, :]   # [CLS] token
+
+
+class EmotionShiftDetector(nn.Module):
+    """
+    ESD auxiliary task module (Section 3.4).
+    Uses BiLSTM over vector-subtracted emotion semantic deviations.
+    """
+    def __init__(self, input_size, lstm_hidden=200, num_shift_labels=3):
+        super().__init__()
+        self.bilstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.classifier = nn.Linear(lstm_hidden * 2, num_shift_labels)
+
+    def forward(self, emotion_repr, speakers, lengths):
+        """
+        emotion_repr : [B, T, hidden_size]  — BERT [CLS] reps for each utterance
+        speakers     : list of list of speaker IDs
+        lengths      : list of conversation lengths
+
+        Returns:
+          shift_repr  : [B, T, lstm_hidden*2]   — for concatenation with ERC
+          shift_logits: [B, T, num_shift_labels] — for auxiliary loss
+        """
+        B, T, H = emotion_repr.shape
+        device   = emotion_repr.device
+
+        # Compute per-utterance emotion semantic deviation:
+        # dev_i = t_prev_same_speaker - t_current  (Eq. 1)
+        deviation = torch.zeros(B, T, H, device=device)
+        for b in range(B):
+            speaker_last = {}   # speaker -> last utterance index
+            for t in range(lengths[b]):
+                spk = speakers[b][t]
+                if spk in speaker_last:
+                    prev_t = speaker_last[spk]
+                    deviation[b, t] = emotion_repr[b, prev_t] - emotion_repr[b, t]
+                # else deviation stays zero vector ([Start])
+                speaker_last[spk] = t
+
+        # BiLSTM over deviation sequence
+        packed_input = nn.utils.rnn.pack_padded_sequence(
+            deviation, lengths, batch_first=True, enforce_sorted=False
+        )
+        packed_output, _ = self.bilstm(packed_input)
+        shift_repr, _    = nn.utils.rnn.pad_packed_sequence(
+            packed_output, batch_first=True, total_length=T
+        )   # [B, T, lstm_hidden*2]
+
+        shift_logits = self.classifier(shift_repr)   # [B, T, num_shift_labels]
+        return shift_repr, shift_logits
+
+
+class EmotionRecognizer(nn.Module):
+    """
+    ERC main task module (Section 3.5).
+    Concatenates BERT repr + shift repr, adds positional encoding,
+    then runs a Transformer encoder.
+    """
+    def __init__(self, bert_hidden=768, shift_hidden=400,
+                 n_layers=6, n_heads=3, dropout=0.1, num_emotion_labels=7):
+        super().__init__()
+        d_model = bert_hidden + shift_hidden   # 768 + 400 = 1168
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 2, dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.classifier  = nn.Linear(d_model, num_emotion_labels)
+        self.d_model     = d_model
+
+    def _positional_encoding(self, T, d_model, device):
+        """Sinusoidal positional encoding (Eq. 2–3 from paper)."""
+        pe = torch.zeros(T, d_model, device=device)
+        pos = torch.arange(T, device=device).unsqueeze(1).float()
+        div = torch.exp(
+            torch.arange(0, d_model, 2, device=device).float()
+            * (-np.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[:d_model // 2])
+        return pe.unsqueeze(0)   # [1, T, d_model]
+
+    def forward(self, emotion_repr, shift_repr, lengths):
+        """
+        emotion_repr : [B, T, bert_hidden]
+        shift_repr   : [B, T, shift_hidden]
+        lengths      : list[int]
+
+        Returns: logits [B, T, num_emotion_labels]
+        """
+        B, T, _ = emotion_repr.shape
+        device   = emotion_repr.device
+
+        # Concatenate and add positional encoding
+        combined = torch.cat([emotion_repr, shift_repr], dim=-1)   # [B,T,d_model]
+        combined = combined + self._positional_encoding(T, self.d_model, device)
+
+        # Create padding mask for Transformer (True = ignore)
+        pad_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+        for b, l in enumerate(lengths):
+            pad_mask[b, :l] = False
+
+        out     = self.transformer(combined, src_key_padding_mask=pad_mask)
+        logits  = self.classifier(out)   # [B, T, num_emotion_labels]
+        return logits
+
+
+class ESD_ERC(nn.Module):
+    """
+    Full ESD-ERC model (Fig. 2 in the paper).
+    Multi-task: auxiliary ESD + main ERC.
+    """
+    def __init__(self, bert_model_name="bert-base-uncased",
+                 lstm_hidden=200, n_layers=6, n_heads=3,
+                 dropout=0.1, num_emotion_labels=7, num_shift_labels=3):
+        super().__init__()
+
+        self.encoder = UtteranceEncoder(bert_model_name)
+        bert_hidden  = self.encoder.hidden_size   # 768
+        shift_hidden = lstm_hidden * 2            # 400
+
+        self.esd = EmotionShiftDetector(
+            input_size=bert_hidden,
+            lstm_hidden=lstm_hidden,
+            num_shift_labels=num_shift_labels
+        )
+        self.erc = EmotionRecognizer(
+            bert_hidden=bert_hidden,
+            shift_hidden=shift_hidden,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            num_emotion_labels=num_emotion_labels
+        )
+
+    def forward(self, input_ids, attention_mask, speakers, lengths):
+        """
+        input_ids      : [B, T, seq_len]
+        attention_mask : [B, T, seq_len]
+        speakers       : list[list[str]]
+        lengths        : list[int]
+        """
+        B, T, seq_len = input_ids.shape
+
+        # Flatten [B,T] -> [B*T] for BERT
+        flat_ids   = input_ids.view(B * T, seq_len)
+        flat_masks = attention_mask.view(B * T, seq_len)
+
+        emotion_repr_flat = self.encoder(flat_ids, flat_masks)          # [B*T, 768]
+        emotion_repr      = emotion_repr_flat.view(B, T, -1)            # [B, T, 768]
+
+        # Auxiliary task: Emotion Shift Detection
+        shift_repr, shift_logits = self.esd(emotion_repr, speakers, lengths)
+
+        # Main task: Emotion Recognition
+        emotion_logits = self.erc(emotion_repr, shift_repr, lengths)
+
+        return emotion_logits, shift_logits
+
+
+# =============================================================================
+# SECTION 6: LOSS, TRAINING AND EVALUATION FUNCTIONS
+# =============================================================================
+
+def compute_loss(emotion_logits, shift_logits,
+                 emotion_labels, shift_labels, lengths):
+    """
+    Joint loss L = L_EM + L_ES  (Eq. 6)
+    Masks out padding positions (label == -1).
+    """
+    B, T, n_emo   = emotion_logits.shape
+    _,  _, n_shift = shift_logits.shape
+
+    emo_loss_fn   = nn.CrossEntropyLoss(ignore_index=-1)
+    shift_loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    emo_loss   = emo_loss_fn(emotion_logits.view(B * T, n_emo),
+                              emotion_labels.view(B * T))
+    shift_loss = shift_loss_fn(shift_logits.view(B * T, n_shift),
+                                shift_labels.view(B * T))
+
+    return emo_loss + shift_loss, emo_loss.item(), shift_loss.item()
+
+
+def get_predictions(emotion_logits, emotion_labels, lengths,
+                    exclude_neutral=True, neutral_idx=None):
+    """
+    Collect predictions and ground truths, excluding padding and
+    (optionally) the neutral class to match paper's evaluation protocol.
+    """
+    B, T, _ = emotion_logits.shape
+    preds, trues = [], []
+
+    for b in range(B):
+        for t in range(lengths[b]):
+            true_label = emotion_labels[b, t].item()
+            if true_label == -1:
+                continue
+            if exclude_neutral and neutral_idx is not None and true_label == neutral_idx:
+                continue
+            pred_label = emotion_logits[b, t].argmax().item()
+            preds.append(pred_label)
+            trues.append(true_label)
+
+    return trues, preds
+
+
+def evaluate(model, loader, label_encoder, device,
+             exclude_neutral=True, return_report=False):
+    """
+    Evaluate the model on a DataLoader.
+    Returns Micro-F1, Macro-F1 (and optionally a full classification report).
+    """
+    model.eval()
+    all_trues, all_preds = [], []
+
+    neutral_idx = None
+    if exclude_neutral and "neutral" in list(label_encoder.classes_):
+        neutral_idx = int(label_encoder.transform(["neutral"])[0])
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            emotion_labels = batch["emotion_labels"].to(device)
+            lengths        = batch["lengths"]
+            speakers       = []   # need to rebuild per-batch speakers from dataset
+            # Note: speakers list not stored in collate; we pass empty list
+            # and the model handles it (deviation = 0 for all when no speaker info)
+            # For proper speaker-aware inference, use a Dataset that stores them.
+            # See EnhancedConversationDataset below for the corrected version.
+
+            emotion_logits, _ = model(input_ids, attention_mask,
+                                      [["A"] * l for l in lengths], lengths)
+
+            trues, preds = get_predictions(
+                emotion_logits, emotion_labels, lengths,
+                exclude_neutral=exclude_neutral, neutral_idx=neutral_idx
+            )
+            all_trues.extend(trues)
+            all_preds.extend(preds)
+
+    if len(all_trues) == 0:
+        return 0.0, 0.0
+
+    micro_f1 = f1_score(all_trues, all_preds, average="micro", zero_division=0)
+    macro_f1 = f1_score(all_trues, all_preds, average="macro", zero_division=0)
+
+    if return_report:
+        labels_to_report = [i for i in range(len(label_encoder.classes_))
+                            if not (exclude_neutral and i == neutral_idx)]
+        target_names = [label_encoder.classes_[i] for i in labels_to_report]
+        report = classification_report(
+            all_trues, all_preds,
+            labels=labels_to_report,
+            target_names=target_names,
+            zero_division=0
+        )
+        return micro_f1, macro_f1, report
+
+    return micro_f1, macro_f1
+
+
+# =============================================================================
+# NOTE: Speaker-Aware Evaluate (Recommended for correct results)
+# =============================================================================
+
+class EnhancedConversationDataset(Dataset):
+    """
+    Same as ConversationDataset but also stores speakers for correct
+    shift deviation calculation during inference.
+    """
+    def __init__(self, conversations, label_encoder, tokenizer, max_len=128):
+        self.conversations = conversations
+        self.label_encoder = label_encoder
+        self.tokenizer     = tokenizer
+        self.max_len       = max_len
+
+    def __len__(self):
+        return len(self.conversations)
+
+    def __getitem__(self, idx):
+        conv = self.conversations[idx]
+        input_ids_list, attention_mask_list = [], []
+        emotion_labels, shift_labels, speakers = [], [], []
+
+        for utt_dict in conv:
+            enc = self.tokenizer(
+                utt_dict["utterance"], max_length=self.max_len,
+                padding="max_length", truncation=True, return_tensors="pt"
+            )
+            input_ids_list.append(enc["input_ids"].squeeze(0))
+            attention_mask_list.append(enc["attention_mask"].squeeze(0))
+            emotion_labels.append(int(self.label_encoder.transform([utt_dict["emotion"]])[0]))
+            shift_labels.append(int(utt_dict["shift_label"]))
+            speakers.append(utt_dict["speaker"])
+
+        return {
+            "input_ids":      torch.stack(input_ids_list),
+            "attention_mask": torch.stack(attention_mask_list),
+            "emotion_labels": torch.tensor(emotion_labels, dtype=torch.long),
+            "shift_labels":   torch.tensor(shift_labels,   dtype=torch.long),
+            "speakers":       speakers,
+            "length":         len(conv)
+        }
+
+
+def collate_fn_with_speakers(batch):
+    max_len    = max(item["length"] for item in batch)
+    seq_len    = batch[0]["input_ids"].shape[1]
+    B          = len(batch)
+
+    input_ids_batch      = torch.zeros(B, max_len, seq_len, dtype=torch.long)
+    attention_mask_batch = torch.zeros(B, max_len, seq_len, dtype=torch.long)
+    emotion_labels_batch = torch.full((B, max_len), -1, dtype=torch.long)
+    shift_labels_batch   = torch.full((B, max_len), -1, dtype=torch.long)
+    speakers_batch       = []
+    conv_lengths         = []
+
+    for i, item in enumerate(batch):
+        T = item["length"]
+        input_ids_batch[i, :T]      = item["input_ids"]
+        attention_mask_batch[i, :T] = item["attention_mask"]
+        emotion_labels_batch[i, :T] = item["emotion_labels"]
+        shift_labels_batch[i, :T]   = item["shift_labels"]
+        speakers_batch.append(item["speakers"])
+        conv_lengths.append(T)
+
+    return {
+        "input_ids":      input_ids_batch,
+        "attention_mask": attention_mask_batch,
+        "emotion_labels": emotion_labels_batch,
+        "shift_labels":   shift_labels_batch,
+        "speakers":       speakers_batch,
+        "lengths":        conv_lengths
+    }
+
+
+def evaluate_with_speakers(model, loader, label_encoder, device,
+                            exclude_neutral=True, return_report=False):
+    """Correct evaluation with per-speaker shift detection."""
+    model.eval()
+    all_trues, all_preds = [], []
+
+    neutral_idx = None
+    if exclude_neutral and "neutral" in list(label_encoder.classes_):
+        neutral_idx = int(label_encoder.transform(["neutral"])[0])
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            emotion_labels = batch["emotion_labels"].to(device)
+            speakers       = batch["speakers"]
+            lengths        = batch["lengths"]
+
+            emotion_logits, _ = model(input_ids, attention_mask, speakers, lengths)
+            trues, preds      = get_predictions(
+                emotion_logits, emotion_labels, lengths,
+                exclude_neutral=exclude_neutral, neutral_idx=neutral_idx
+            )
+            all_trues.extend(trues)
+            all_preds.extend(preds)
+
+    if len(all_trues) == 0:
+        return 0.0, 0.0
+
+    micro_f1 = f1_score(all_trues, all_preds, average="micro", zero_division=0)
+    macro_f1 = f1_score(all_trues, all_preds, average="macro", zero_division=0)
+
+    if return_report:
+        labels_to_report = [i for i in range(len(label_encoder.classes_))
+                            if not (exclude_neutral and i == neutral_idx)]
+        target_names     = [label_encoder.classes_[i] for i in labels_to_report]
+        report = classification_report(
+            all_trues, all_preds,
+            labels=labels_to_report,
+            target_names=target_names,
+            zero_division=0
+        )
+        return micro_f1, macro_f1, report
+
+    return micro_f1, macro_f1
+
+
+# =============================================================================
+# SECTION 7: TRAINING LOOP
+# =============================================================================
+
+def train_model(model, train_loader, val_loader, label_encoder,
+                device, num_epochs=10, lr=2e-5, warmup_ratio=0.1,
+                save_path="best_esd_erc.pt", exclude_neutral=True):
+    """
+    Trains ESD-ERC with AdamW + linear warmup scheduler.
+    Saves the best checkpoint based on validation Macro-F1.
+    Returns training history for plotting.
+    """
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    total_steps   = len(train_loader) * num_epochs
+    warmup_steps  = int(total_steps * warmup_ratio)
+    scheduler     = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+
+    history = {
+        "train_loss": [], "val_micro_f1": [], "val_macro_f1": []
+    }
+    best_macro_f1 = 0.0
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+
+        for step, batch in enumerate(train_loader):
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            emotion_labels = batch["emotion_labels"].to(device)
+            shift_labels   = batch["shift_labels"].to(device)
+            speakers       = batch["speakers"]
+            lengths        = batch["lengths"]
+
+            optimizer.zero_grad()
+            emotion_logits, shift_logits = model(
+                input_ids, attention_mask, speakers, lengths
+            )
+            loss, emo_loss, shift_loss = compute_loss(
+                emotion_logits, shift_logits,
+                emotion_labels, shift_labels, lengths
+            )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            epoch_loss += loss.item()
+
+            if (step + 1) % 50 == 0:
+                print(f"  Epoch {epoch} | Step {step+1}/{len(train_loader)} "
+                      f"| Loss: {loss.item():.4f} "
+                      f"(ERC: {emo_loss:.4f}, ESD: {shift_loss:.4f})")
+
+        avg_loss = epoch_loss / len(train_loader)
+        val_micro, val_macro = evaluate_with_speakers(
+            model, val_loader, label_encoder, device,
+            exclude_neutral=exclude_neutral
+        )
+
+        history["train_loss"].append(avg_loss)
+        history["val_micro_f1"].append(val_micro * 100)
+        history["val_macro_f1"].append(val_macro * 100)
+
+        print(f"\nEpoch {epoch}/{num_epochs} | "
+              f"Train Loss: {avg_loss:.4f} | "
+              f"Val Micro-F1: {val_micro*100:.2f}% | "
+              f"Val Macro-F1: {val_macro*100:.2f}%")
+
+        # Save best model
+        if val_macro > best_macro_f1:
+            best_macro_f1 = val_macro
+            torch.save(model.state_dict(), save_path)
+            print(f"  ✓ Best model saved (Macro-F1: {val_macro*100:.2f}%)")
+
+    print(f"\nTraining complete. Best Val Macro-F1: {best_macro_f1*100:.2f}%")
+    return history
+
+
+# =============================================================================
+# SECTION 8: ABLATION — BASELINE MODELS
+# =============================================================================
+
+class BERTOnly(nn.Module):
+    """
+    Ablation: BERT only (no ESD, no Transformer context).
+    Equivalent to the 'BERT' row in Table 5.
+    """
+    def __init__(self, bert_model_name="bert-base-uncased", num_labels=7):
+        super().__init__()
+        self.encoder    = UtteranceEncoder(bert_model_name)
+        self.classifier = nn.Linear(self.encoder.hidden_size, num_labels)
+
+    def forward(self, input_ids, attention_mask, speakers=None, lengths=None):
+        B, T, seq_len = input_ids.shape
+        flat_ids      = input_ids.view(B * T, seq_len)
+        flat_masks    = attention_mask.view(B * T, seq_len)
+        repr_flat     = self.encoder(flat_ids, flat_masks)          # [B*T, 768]
+        logits_flat   = self.classifier(repr_flat)                  # [B*T, n_labels]
+        logits        = logits_flat.view(B, T, -1)
+        # Return dummy shift logits for compatibility
+        dummy_shift   = torch.zeros(B, T, 3, device=logits.device)
+        return logits, dummy_shift
+
+
+class ESD_ERC_NoESD(nn.Module):
+    """
+    Ablation: ESD-ERC without the ESD auxiliary task.
+    BERT + Transformer, no shift representation.
+    Equivalent to 'ESD-ERC (w/o ESD)' in Table 5.
+    """
+    def __init__(self, bert_model_name="bert-base-uncased",
+                 n_layers=6, n_heads=3, dropout=0.1, num_labels=7):
+        super().__init__()
+        self.encoder  = UtteranceEncoder(bert_model_name)
+        d_model       = self.encoder.hidden_size   # 768
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 2, dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.classifier  = nn.Linear(d_model, num_labels)
+        self.d_model     = d_model
+
+    def _positional_encoding(self, T, d, device):
+        pe  = torch.zeros(T, d, device=device)
+        pos = torch.arange(T, device=device).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d, 2, device=device).float()
+                        * (-np.log(10000.0) / d))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[:d // 2])
+        return pe.unsqueeze(0)
+
+    def forward(self, input_ids, attention_mask, speakers=None, lengths=None):
+        B, T, seq_len = input_ids.shape
+        flat_ids      = input_ids.view(B * T, seq_len)
+        flat_masks    = attention_mask.view(B * T, seq_len)
+        repr_flat     = self.encoder(flat_ids, flat_masks)
+        emotion_repr  = repr_flat.view(B, T, -1)
+
+        combined  = emotion_repr + self._positional_encoding(T, self.d_model, emotion_repr.device)
+        pad_mask  = torch.ones(B, T, dtype=torch.bool, device=emotion_repr.device)
+        if lengths:
+            for b, l in enumerate(lengths):
+                pad_mask[b, :l] = False
+
+        out        = self.transformer(combined, src_key_padding_mask=pad_mask)
+        logits     = self.classifier(out)
+        dummy_shift = torch.zeros(B, T, 3, device=logits.device)
+        return logits, dummy_shift
+
+
+# =============================================================================
+# SECTION 9: RESULTS COMPARISON AND VISUALIZATION
+# =============================================================================
+
+def compare_models(results_dict, dataset_name="DailyDialog"):
+    """
+    results_dict: { "ModelName": {"Micro-F1": float, "Macro-F1": float}, ... }
+    Prints a formatted table and generates a bar chart (matches Table 2/5).
+    """
+    print(f"\n{'='*60}")
+    print(f"  Results Comparison on {dataset_name}")
+    print(f"{'='*60}")
+    print(f"  {'Model':<25} {'Micro-F1':>10} {'Macro-F1':>10}")
+    print(f"  {'-'*45}")
+    for model_name, scores in results_dict.items():
+        micro = scores["Micro-F1"]
+        macro = scores["Macro-F1"]
+        print(f"  {model_name:<25} {micro:>9.2f}% {macro:>9.2f}%")
+    print('='*60)
+
+    # Bar chart
+    models  = list(results_dict.keys())
+    micros  = [results_dict[m]["Micro-F1"] for m in models]
+    macros  = [results_dict[m]["Macro-F1"] for m in models]
+
+    x      = np.arange(len(models))
+    width  = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars1   = ax.bar(x - width/2, micros, width, label="Micro-F1",
+                     color="#4C72B0", edgecolor="black")
+    bars2   = ax.bar(x + width/2, macros, width, label="Macro-F1",
+                     color="#DD8452", edgecolor="black")
+
+    ax.set_xlabel("Model", fontsize=13)
+    ax.set_ylabel("F1 Score (%)", fontsize=13)
+    ax.set_title(f"Model Comparison on {dataset_name}", fontsize=15, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=20, ha="right", fontsize=11)
+    ax.legend(fontsize=12)
+    ax.set_ylim(0, 100)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.7)
+
+    for bar in bars1:
+        ax.annotate(f"{bar.get_height():.1f}",
+                    xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", fontsize=9)
+    for bar in bars2:
+        ax.annotate(f"{bar.get_height():.1f}",
+                    xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", fontsize=9)
+
+    plt.tight_layout()
+    fname = f"results_{dataset_name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.show()
+    print(f"Chart saved to: {fname}")
+
+
+def plot_per_class_f1(results_per_class, dataset_name="DailyDialog"):
+    """
+    results_per_class: {
+       "ModelName": {"anger": f1, "disgust": f1, ...},
+       ...
+    }
+    Generates a grouped bar chart replicating Table 3.
+    """
+    models     = list(results_per_class.keys())
+    categories = list(next(iter(results_per_class.values())).keys())
+    n_cats     = len(categories)
+    n_models   = len(models)
+    x          = np.arange(n_cats)
+    width      = 0.8 / n_models
+    colors     = plt.cm.Set2(np.linspace(0, 1, n_models))
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    for i, (model_name, cat_scores) in enumerate(results_per_class.items()):
+        values = [cat_scores.get(c, 0) * 100 for c in categories]
+        bars   = ax.bar(x + i * width - (n_models - 1) * width / 2,
+                        values, width, label=model_name,
+                        color=colors[i], edgecolor="black")
+
+    ax.set_xlabel("Emotion Category", fontsize=13)
+    ax.set_ylabel("F1 Score (%)", fontsize=13)
+    ax.set_title(f"Per-Category F1 on {dataset_name}", fontsize=15, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=11)
+    ax.legend(fontsize=11)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.7)
+    plt.tight_layout()
+
+    fname = f"per_class_f1_{dataset_name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.show()
+    print(f"Chart saved to: {fname}")
+
+
+def plot_training_history(history, title="ESD-ERC Training History"):
+    """Plot loss and F1 curves over epochs."""
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(epochs, history["train_loss"], "b-o", linewidth=2, label="Train Loss")
+    ax1.set_title("Training Loss", fontsize=14, fontweight="bold")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.grid(True, linestyle="--", alpha=0.6)
+    ax1.legend()
+
+    ax2.plot(epochs, history["val_micro_f1"], "g-o", linewidth=2, label="Val Micro-F1")
+    ax2.plot(epochs, history["val_macro_f1"], "r-s", linewidth=2, label="Val Macro-F1")
+    ax2.set_title("Validation F1 Scores", fontsize=14, fontweight="bold")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("F1 Score (%)")
+    ax2.grid(True, linestyle="--", alpha=0.6)
+    ax2.legend()
+
+    fig.suptitle(title, fontsize=16, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("training_history.png", dpi=150)
+    plt.show()
+    print("Training history saved to: training_history.png")
+
+
+def plot_emotion_shift_distribution(conversations, dataset_name="DailyDialog"):
+    """
+    Replicates Figure 3 from the paper:
+    Emotion shift distribution per emotion category.
+    """
+    # emotion -> {0: count, 1: count, 2: count}
+    emotion_shift = defaultdict(lambda: defaultdict(int))
+    for conv in conversations:
+        for utt in conv:
+            emotion_shift[utt["emotion"]][utt["shift_label"]] += 1
+
+    emotions = sorted(emotion_shift.keys())
+    no_shift, shift, start = [], [], []
+    for emo in emotions:
+        total = sum(emotion_shift[emo].values())
+        no_shift.append(emotion_shift[emo][0] / total * 100)
+        shift.append(emotion_shift[emo][1] / total * 100)
+        start.append(emotion_shift[emo][2] / total * 100)
+
+    x     = np.arange(len(emotions))
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.barh(x, no_shift, color="#4C72B0", label="No Emotion Shift")
+    ax.barh(x, shift, left=no_shift, color="#DD8452", label="Emotion Shift")
+    ax.barh(x, start,
+            left=[n + s for n, s in zip(no_shift, shift)],
+            color="#55A868", label="[Start]")
+
+    ax.set_yticks(x)
+    ax.set_yticklabels(emotions, fontsize=12)
+    ax.set_xlabel("Percentage (%)", fontsize=13)
+    ax.set_title(f"Emotion Shift Distribution — {dataset_name} (Fig. 3 reproduction)",
+                 fontsize=14, fontweight="bold")
+    ax.legend(fontsize=11)
+    ax.xaxis.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+
+    fname = f"shift_distribution_{dataset_name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.show()
+    print(f"Shift distribution saved to: {fname}")
+
+
+# =============================================================================
+# SECTION 10: MAIN PIPELINE — RUN EVERYTHING
+# =============================================================================
+
+def run_pipeline(dataset="dailydialog",
+                 batch_size=8,
+                 max_len=128,
+                 num_epochs=10,
+                 lr=2e-5,
+                 bert_model="bert-base-uncased",
+                 run_ablation=True,
+                 dailydialog_dir="./dailydialog",
+                 meld_dir="./data/meld"):
+    """
+    Full end-to-end pipeline:
+      1. Load dataset
+      2. Generate shift labels & stats
+      3. Build dataloaders
+      4. Train ESD-ERC
+      5. (Optional) Train ablation models
+      6. Evaluate all on test set
+      7. Print & plot comparison tables and figures
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1: Load Data
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 1: Loading Dataset")
+    print("="*60)
+
+    if dataset.lower() == "dailydialog":
+        train_raw, val_raw, test_raw, emotion_labels = load_dailydialog(dailydialog_dir)
+        dataset_name = "DailyDialog"
+    elif dataset.lower() == "meld":
+        train_raw, val_raw, test_raw, emotion_labels = load_meld(meld_dir)
+        dataset_name = "MELD"
+    else:
+        raise ValueError("dataset must be 'dailydialog' or 'meld'")
+
+    # ------------------------------------------------------------------
+    # Step 2: Generate Shift Labels + Stats
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 2: Generating Emotion Shift Labels")
+    print("="*60)
+
+    train_convs = generate_emotion_shift_labels(train_raw)
+    val_convs   = generate_emotion_shift_labels(val_raw)
+    test_convs  = generate_emotion_shift_labels(test_raw)
+
+    label_encoder = build_label_encoder(train_convs + val_convs + test_convs,
+                                        emotion_labels)
+
+    dataset_stats(train_convs, label_encoder, "Train")
+    dataset_stats(val_convs,   label_encoder, "Val")
+    dataset_stats(test_convs,  label_encoder, "Test")
+
+    # Plot shift distribution (Fig. 3)
+    plot_emotion_shift_distribution(train_convs, dataset_name)
+
+    # ------------------------------------------------------------------
+    # Step 3: Tokenizer & DataLoaders
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 3: Building DataLoaders")
+    print("="*60)
+
+    tokenizer = BertTokenizer.from_pretrained(bert_model)
+    num_emo   = len(emotion_labels)
+
+    def make_loaders(convs_train, convs_val, convs_test):
+        def mk(convs, shuffle):
+            ds = EnhancedConversationDataset(convs, label_encoder, tokenizer, max_len)
+            return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                              collate_fn=collate_fn_with_speakers)
+        return mk(convs_train, True), mk(convs_val, False), mk(convs_test, False)
+
+    train_loader, val_loader, test_loader = make_loaders(
+        train_convs, val_convs, test_convs
+    )
+    print(f"Loaders ready — Train batches: {len(train_loader)}, "
+          f"Val: {len(val_loader)}, Test: {len(test_loader)}")
+
+    # ------------------------------------------------------------------
+    # Step 4: Train ESD-ERC
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 4: Training ESD-ERC (Main Model)")
+    print("="*60)
+
+    model_esd_erc = ESD_ERC(
+        bert_model_name=bert_model,
+        num_emotion_labels=num_emo
+    ).to(DEVICE)
+
+    history = train_model(
+        model_esd_erc, train_loader, val_loader, label_encoder,
+        DEVICE, num_epochs=num_epochs, lr=lr,
+        save_path="best_esd_erc.pt"
+    )
+    plot_training_history(history, title=f"ESD-ERC Training — {dataset_name}")
+
+    # Load best checkpoint
+    model_esd_erc.load_state_dict(torch.load("best_esd_erc.pt", map_location=DEVICE))
+
+    # ------------------------------------------------------------------
+    # Step 5: (Optional) Train Ablation Models
+    # ------------------------------------------------------------------
+    results = {}
+
+    if run_ablation:
+        print("\n" + "="*60)
+        print("  STEP 5: Training Ablation Models")
+        print("="*60)
+
+        # --- BERT Only ---
+        print("\n  Training: BERT Only")
+        model_bert = BERTOnly(bert_model, num_labels=num_emo).to(DEVICE)
+        train_model(model_bert, train_loader, val_loader, label_encoder,
+                    DEVICE, num_epochs=num_epochs, lr=lr,
+                    save_path="best_bert_only.pt")
+        model_bert.load_state_dict(torch.load("best_bert_only.pt", map_location=DEVICE))
+
+        # --- ESD-ERC w/o ESD ---
+        print("\n  Training: ESD-ERC (w/o ESD)")
+        model_no_esd = ESD_ERC_NoESD(bert_model, num_labels=num_emo).to(DEVICE)
+        train_model(model_no_esd, train_loader, val_loader, label_encoder,
+                    DEVICE, num_epochs=num_epochs, lr=lr,
+                    save_path="best_no_esd.pt")
+        model_no_esd.load_state_dict(torch.load("best_no_esd.pt", map_location=DEVICE))
+
+        # --- Evaluate ablation models ---
+        print("\n  Evaluating: BERT Only")
+        micro, macro = evaluate_with_speakers(
+            model_bert, test_loader, label_encoder, DEVICE
+        )
+        results["BERT"] = {"Micro-F1": micro * 100, "Macro-F1": macro * 100}
+
+        print("\n  Evaluating: ESD-ERC (w/o ESD)")
+        micro, macro = evaluate_with_speakers(
+            model_no_esd, test_loader, label_encoder, DEVICE
+        )
+        results["ESD-ERC (w/o ESD)"] = {"Micro-F1": micro * 100, "Macro-F1": macro * 100}
+
+    # ------------------------------------------------------------------
+    # Step 6: Evaluate ESD-ERC on Test Set
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 6: Final Evaluation on Test Set")
+    print("="*60)
+
+    micro, macro, report = evaluate_with_speakers(
+        model_esd_erc, test_loader, label_encoder, DEVICE,
+        return_report=True
+    )
+    results["ESD-ERC"] = {"Micro-F1": micro * 100, "Macro-F1": macro * 100}
+
+    print("\nClassification Report (ESD-ERC):")
+    print(report)
+
+    # ------------------------------------------------------------------
+    # Step 7: Print & Plot Results
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("  STEP 7: Results Comparison")
+    print("="*60)
+
+    # Move ESD-ERC to end for visual clarity
+    ordered_results = {}
+    for k in ["BERT", "ESD-ERC (w/o ESD)", "ESD-ERC"]:
+        if k in results:
+            ordered_results[k] = results[k]
+
+    compare_models(ordered_results, dataset_name)
+
+    print("\nAll outputs saved. Pipeline complete!")
+    return ordered_results
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    # ---------------------------------------------------------------
+    # Configuration — change these as needed
+    # ---------------------------------------------------------------
+    CONFIG = {
+        "dataset":      "dailydialog",        # "dailydialog" or "meld"
+        "batch_size":   8,                    # reduce to 4 if GPU runs out of memory
+        "max_len":      128,                  # max tokens per utterance
+        "num_epochs":   10,                   # 2-3 for a quick test, 10 for full run
+        "lr":           2e-5,
+        "bert_model":   "bert-base-uncased",
+        "run_ablation": True,                 # set False to skip BERT-only & w/o ESD models
+
+        # ── DailyDialog ───────────────────────────────────────────────
+        # Download from Kaggle (free account required):
+        #   https://www.kaggle.com/datasets/thedevastator/
+        #       dailydialog-multi-turn-dialog-with-intention-and
+        #
+        # Via Kaggle API in Colab (after uploading kaggle.json):
+        #   !pip install kaggle -q
+        #   !mkdir -p ~/.kaggle && cp kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+        #   !kaggle datasets download -d thedevastator/dailydialog-multi-turn-dialog-with-intention-and
+        #   !unzip -q dailydialog-multi-turn-dialog-with-intention-and.zip -d ./dailydialog
+        #
+        # The zip gives 3 CSV files: train.csv, validation.csv, test.csv
+        # Point dailydialog_dir to the folder containing those 3 files.
+        "dailydialog_dir": "./dailydialog",
+
+        # ── MELD ──────────────────────────────────────────────────────
+        # Download from: https://github.com/declare-lab/MELD (Releases tab)
+        # Extract so that meld_dir contains:
+        #   train_sent_emo.csv / dev_sent_emo.csv / test_sent_emo.csv
+        "meld_dir": "./data/meld",
+    }
+
+    results = run_pipeline(**CONFIG)
