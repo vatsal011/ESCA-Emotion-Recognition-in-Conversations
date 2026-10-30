@@ -64,8 +64,3 @@ standard class weighting.
 - Observed greater improvements on DailyDialog, where
   the neutral-to-fear imbalance exceeds 490:1, compared
   to approximately 18:1 in MELD.
-
-## Tech Stack
-
-**Python | PyTorch | Hugging Face Transformers |
-BERT | BiLSTM | Transformer | Google Colab | CUDA**
